@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,7 +14,54 @@ using UnityEngine.Networking;
 using CT = System.Threading.CancellationToken;
 
 public static partial class AwaitableUtility {
-    public static async Awaitable<T> AsAwaitable<T>(this T operation, CT cancellationToken = default, Action<float>? progress = null) where T : AsyncOperation {
+    /// <returns>IsCancelled</returns>
+    public static async Awaitable<bool> SuppressThrow(this Awaitable awaitable) {
+        try {
+            await awaitable;
+            return false;
+        } catch (OperationCanceledException) {
+            return true;
+        }
+    }
+
+    /// <returns>(IsCancelled,Result?)</returns>
+    public static async Awaitable<(bool isCancelled, T? value)> SuppressThrow<T>(this Awaitable<T> awaitable) {
+        try {
+            var result = await awaitable;
+            return (false, result);
+        } catch (OperationCanceledException) {
+            return (true, default);
+        }
+    }
+
+    public static void Forget(this Awaitable awaitable) { }
+    public static void Forget<T>(this Awaitable<T> awaitable) { }
+
+    public static async Awaitable<UnityWebRequest> WithCancellation(this UnityWebRequest request, CT cancellationToken, Action<float>? progress = null) {
+        var wr = request.SendWebRequest();
+        while (!wr.isDone) {
+            if (cancellationToken.IsCancellationRequested) {
+                request.Abort();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            progress?.Invoke(wr.progress);
+            await Awaitable.Yield();
+        }
+        return request;
+    }
+
+    public static async Awaitable<T[]> WithCancellation<T>(this AsyncInstantiateOperation<T> operation, CT cancellationToken) {
+        while (!operation.isDone) {
+            if (cancellationToken.IsCancellationRequested) {
+                operation.Cancel();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            await Awaitable.Yield();
+        }
+        return operation.Result;
+    }
+
+    public static async Awaitable<T> WithCancellation<T>(this T operation, CT cancellationToken, Action<float>? progress = null) where T : AsyncOperation {
         while (!operation.isDone) {
             cancellationToken.ThrowIfCancellationRequested();
             progress?.Invoke(operation.progress);
@@ -21,6 +69,7 @@ public static partial class AwaitableUtility {
         }
         return operation;
     }
+
     public static async Awaitable AsAwaitable(this IEnumerator coroutine, MonoBehaviour monoBehaviour, CT cancellationToken = default) {
         static IEnumerator wrapper(IEnumerator coroutine, Action onCompleted) {
             yield return coroutine;
@@ -36,11 +85,15 @@ public static partial class AwaitableUtility {
 }
 
 [AsyncMethodBuilder(typeof(Awaitable.AwaitableAsyncMethodBuilder<>))]
-public struct Awaitable<T> {
+public partial struct Awaitable<T> {
     UnityEngine.Awaitable<T> wrapped;
 
     public UnityEngine.Awaitable<T>.Awaiter GetAwaiter() {
         return wrapped.GetAwaiter();
+    }
+
+    public void Cancel() {
+        wrapped.Cancel();
     }
 
     public IEnumerator ToCoroutine(Action<T>? callback = null) {
@@ -65,6 +118,7 @@ public partial struct Awaitable: IEnumerator {
         var wrap = UnityEngine.Awaitable.WaitForSecondsAsync(seconds, cancellationToken);
         return new Awaitable(wrap);
     }
+
     public static Awaitable FromAsyncOperation(AsyncOperation op, CT cancellationToken = default) {
         var wrap = UnityEngine.Awaitable.FromAsyncOperation(op, cancellationToken);
         return new Awaitable(wrap);
@@ -92,17 +146,21 @@ public partial struct Awaitable: IEnumerator {
         while (condition.Invoke()) await UnityEngine.Awaitable.FixedUpdateAsync(cancellationToken);
     }
     public static async Awaitable WaitUntilAsync(Func<bool> condition, CT cancellationToken = default) {
-        while (!condition.Invoke()) await UnityEngine.Awaitable.FixedUpdateAsync(cancellationToken);
+        while (!condition.Invoke()) {
+
+            cancellationToken.ThrowIfCancellationRequested();
+            await UnityEngine.Awaitable.FixedUpdateAsync(cancellationToken);
+        }
     }
     public static void Void(Func<Awaitable> func) {
         _ = func.Invoke();
     }
-    public static async Awaitable WhenAllAsync(IEnumerable<Awaitable> awaitables) {
+    public static async Awaitable WhenAllAsync(IEnumerable<Awaitable> awaitables, CT cancellationToken = default) {
         var awaiters = awaitables.Select(x => x.GetAwaiter());
         var isAllCompleted = true;
         do {
             isAllCompleted = true;
-
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var awaiter in awaiters) {
                 if (!awaiter.IsCompleted) {
                     isAllCompleted = false;
@@ -112,12 +170,12 @@ public partial struct Awaitable: IEnumerator {
             }
         } while (!isAllCompleted);
     }
-    public static async Awaitable<IEnumerable<T>> WhenAllAsync<T>(IEnumerable<Awaitable<T>> awaitables) {
+    public static async Awaitable<IEnumerable<T>> WhenAllAsync<T>(IEnumerable<Awaitable<T>> awaitables, CT cancellationToken = default) {
         var awaiters = awaitables.Select(x => x.GetAwaiter());
         var isAllCompleted = true;
         do {
             isAllCompleted = true;
-
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var awaiter in awaiters) {
                 if (!awaiter.IsCompleted) {
                     isAllCompleted = false;
@@ -128,12 +186,13 @@ public partial struct Awaitable: IEnumerator {
         } while (!isAllCompleted);
         return awaiters.Select(x => x.GetResult());
     }
-    public static async Awaitable WhenAnyAsync(IEnumerable<Awaitable> awaitables) {
+    public static async Awaitable WhenAnyAsync(IEnumerable<Awaitable> awaitables, CT cancellationToken = default) {
         var awaiters = awaitables.Select(x => x.GetAwaiter());
+
         var isAnyCompleted = false;
         do {
             isAnyCompleted = false;
-
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var awaiter in awaiters) {
                 if (awaiter.IsCompleted) {
                     isAnyCompleted = true;
@@ -143,11 +202,12 @@ public partial struct Awaitable: IEnumerator {
             if (!isAnyCompleted) await Awaitable.Yield();
         } while (!isAnyCompleted);
     }
-    public static async Awaitable<T> WhenAnyAsync<T>(IEnumerable<Awaitable<T>> awaitables) {
+    public static async Awaitable<T> WhenAnyAsync<T>(IEnumerable<Awaitable<T>> awaitables, CT cancellationToken = default) {
         var awaiters = awaitables.Select(x => x.GetAwaiter());
         UnityEngine.Awaitable<T>.Awaiter? result = null;
         do {
             result = null;
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var awaiter in awaiters) {
                 if (awaiter.IsCompleted) {
                     result = awaiter;
@@ -161,17 +221,20 @@ public partial struct Awaitable: IEnumerator {
 
     UnityEngine.Awaitable wrapped;
 
+    public bool IsCompleted => wrapped.IsCompleted;
+    object IEnumerator.Current => null!;
+
     public UnityEngine.Awaitable.Awaiter GetAwaiter() {
         return wrapped.GetAwaiter();
     }
 
-    public void Forget() { }
+    public void Cancel() {
+        wrapped.Cancel();
+    }
 
     Awaitable(UnityEngine.Awaitable wrapped) {
         this.wrapped = wrapped;
     }
-
-    object IEnumerator.Current => null!;
 
     bool IEnumerator.MoveNext() {
         return ((IEnumerator)wrapped).MoveNext();
